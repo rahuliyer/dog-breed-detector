@@ -92,6 +92,17 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(tuple(images.shape), (1, 3, 224, 224))
             self.assertEqual(tuple(labels.shape), (1,))
 
+    def test_loader_rejects_different_class_mapping(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            train_dir = os.path.join(tmpdir, "train")
+            valid_dir = os.path.join(tmpdir, "valid")
+            _write_jpeg(os.path.join(train_dir, "001.Beagle", "a.jpg"))
+            _write_jpeg(os.path.join(valid_dir, "002.Basset_hound", "a.jpg"))
+            classifier = _cpu_classifier(batch_size=1)
+            classifier.get_loader(train_dir, train=True)
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                classifier.get_loader(valid_dir)
+
 
 class TrainLoopTests(unittest.TestCase):
     def _write_split(self, root, split, class_name, count):
@@ -116,7 +127,11 @@ class TrainLoopTests(unittest.TestCase):
                 num_epochs=1,
                 lr=0.01,
             )
-            with mock.patch.object(mod, "build_resnet152", side_effect=lambda n: TinyNet(n)):
+            with mock.patch.object(
+                mod,
+                "build_resnet152",
+                side_effect=lambda n, pretrained=True: TinyNet(n),
+            ):
                 classifier.train(checkpoint, patience=0)
                 acc = classifier.test(checkpoint)
                 preds = classifier.predict_breed(
@@ -125,6 +140,7 @@ class TrainLoopTests(unittest.TestCase):
             self.assertTrue(os.path.exists(checkpoint))
             self.assertGreaterEqual(acc, 0.0)
             self.assertLessEqual(acc, 1.0)
+            self.assertEqual(classifier.last_test_top5, 1.0)
             self.assertTrue(preds)
             self.assertIn(preds[0][0], ("Beagle", "Basset hound"))
             self.assertGreaterEqual(preds[0][1], 0.0)
@@ -176,11 +192,69 @@ class CheckpointTests(unittest.TestCase):
             path = os.path.join(tmpdir, "model.pt")
             classifier.save_model(path)
             loaded = _cpu_classifier(num_breeds=133)
-            with mock.patch.object(mod, "build_resnet152", side_effect=lambda n: TinyNet(n)):
+            with mock.patch.object(
+                mod,
+                "build_resnet152",
+                side_effect=lambda n, pretrained=True: TinyNet(n),
+            ) as build_model:
                 loaded.load_model_from_file(path)
             self.assertEqual(loaded.num_breeds, 2)
             self.assertEqual(loaded.model.fc.out_features, 2)
             self.assertEqual(loaded.class_names, classifier.class_names)
+            build_model.assert_called_once_with(2, pretrained=False)
+
+    def test_checkpoint_image_size_rebuilds_transforms(self):
+        classifier = _cpu_classifier(num_breeds=2, image_size=32)
+        classifier.class_names = ["001.Beagle", "002.Basset_hound"]
+        classifier.model = TinyNet(2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.pt")
+            classifier.save_model(path)
+            loaded = _cpu_classifier(num_breeds=133, image_size=224)
+            with mock.patch.object(
+                mod,
+                "build_resnet152",
+                side_effect=lambda n, pretrained=True: TinyNet(n),
+            ):
+                loaded.load_model_from_file(path)
+            image = Image.new("RGB", (64, 64))
+            self.assertEqual(tuple(loaded.eval_transforms(image).shape), (3, 32, 32))
+
+    def test_cpu_model_is_not_wrapped_for_visible_cuda_devices(self):
+        classifier = _cpu_classifier(num_breeds=2)
+        with (
+            mock.patch.object(
+                mod,
+                "build_resnet152",
+                side_effect=lambda n, pretrained=True: TinyNet(n),
+            ),
+            mock.patch.object(torch.cuda, "device_count", return_value=2),
+        ):
+            model = classifier.get_model(pretrained=False)
+        self.assertNotIsInstance(model, nn.DataParallel)
+
+    def test_test_reloads_requested_checkpoint(self):
+        classifier = _cpu_classifier(num_breeds=2)
+        classifier.class_names = ["001.Beagle", "002.Basset_hound"]
+        classifier.model = TinyNet(2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_dir = os.path.join(tmpdir, "test")
+            _write_jpeg(os.path.join(test_dir, "001.Beagle", "a.jpg"))
+            _write_jpeg(os.path.join(test_dir, "002.Basset_hound", "a.jpg"))
+            classifier.dataset_root = tmpdir
+            checkpoint = os.path.join(tmpdir, "best.pt")
+            classifier.save_model(checkpoint)
+            with mock.patch.object(
+                classifier,
+                "load_model_from_file",
+                wraps=classifier.load_model_from_file,
+            ) as load, mock.patch.object(
+                mod,
+                "build_resnet152",
+                side_effect=lambda n, pretrained=True: TinyNet(n),
+            ):
+                classifier.test(checkpoint)
+            load.assert_called_once_with(checkpoint)
 
 
 class CliTests(unittest.TestCase):

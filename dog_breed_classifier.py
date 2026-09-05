@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 from typing import List, Optional, Sequence, Tuple
 
@@ -67,13 +68,14 @@ def select_predictions(
     return ranked[:3]
 
 
-def build_resnet152(num_classes: int) -> nn.Module:
+def build_resnet152(num_classes: int, pretrained: bool = True) -> nn.Module:
     try:
         from torchvision.models import ResNet152_Weights
 
-        model = resnet152(weights=ResNet152_Weights.DEFAULT)
+        weights = ResNet152_Weights.DEFAULT if pretrained else None
+        model = resnet152(weights=weights)
     except (ImportError, AttributeError, TypeError):
-        model = resnet152(pretrained=True)
+        model = resnet152(pretrained=pretrained)
 
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     for name, param in model.named_parameters():
@@ -92,7 +94,7 @@ def _unwrap_state_dict(state_dict: dict) -> dict:
 
 def _torch_load(path: str, map_location: torch.device):
     try:
-        return torch.load(path, map_location=map_location, weights_only=False)
+        return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
 
@@ -109,6 +111,8 @@ class DogBreedClassifier:
         num_workers: Optional[int] = None,
         device: Optional[torch.device] = None,
         confidence_threshold: float = CONFIDENT_THRESHOLD,
+        seed: int = 42,
+        amp: bool = True,
     ):
         self.dataset_root = dataset_root
         self.num_breeds = num_breeds
@@ -119,10 +123,18 @@ class DogBreedClassifier:
         self.num_workers = min(4, os.cpu_count() or 0) if num_workers is None else num_workers
         self.device = device or get_device()
         self.confidence_threshold = confidence_threshold
+        self.seed = seed
+        self.amp = amp and self.device.type == "cuda"
 
         self.model: Optional[nn.Module] = None
         self.class_names: List[str] = []
+        self.best_valid_loss: Optional[float] = None
+        self.best_epoch: Optional[int] = None
+        self.last_test_top5: Optional[float] = None
 
+        self._configure_transforms()
+
+    def _configure_transforms(self) -> None:
         self.train_transforms = transforms.Compose(
             [
                 transforms.RandomResizedCrop(self.image_size),
@@ -146,16 +158,24 @@ class DogBreedClassifier:
     def get_loader(self, datadir: str, train: bool = False) -> DataLoader:
         transform = self.train_transforms if train else self.eval_transforms
         ds = ImageFolder(datadir, transform)
-        if train or not self.class_names:
+        if self.class_names and ds.classes != self.class_names:
+            raise ValueError(
+                f"Class folders in {datadir} do not match the model: "
+                f"expected {self.class_names}, found {ds.classes}"
+            )
+        if not self.class_names:
             self.class_names = ds.classes
             self.num_breeds = len(ds.classes)
         pin_memory = self.device.type == "cuda"
+        generator = torch.Generator().manual_seed(self.seed) if train else None
         return DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=train,
             num_workers=self.num_workers,
             pin_memory=pin_memory,
+            persistent_workers=self.num_workers > 0,
+            generator=generator,
         )
 
     def get_train_loader(self) -> DataLoader:
@@ -167,9 +187,9 @@ class DogBreedClassifier:
     def get_test_loader(self) -> DataLoader:
         return self.get_loader(os.path.join(self.dataset_root, "test"), train=False)
 
-    def get_model(self) -> nn.Module:
-        model = build_resnet152(self.num_breeds)
-        if torch.cuda.device_count() > 1:
+    def get_model(self, pretrained: bool = True) -> nn.Module:
+        model = build_resnet152(self.num_breeds, pretrained=pretrained)
+        if self.device.type == "cuda" and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
         self.model = model.to(self.device)
         return self.model
@@ -182,12 +202,16 @@ class DogBreedClassifier:
     def save_model(self, filename: str = DEFAULT_MODEL_PATH) -> None:
         model = self._require_model()
         state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        state_dict = {name: tensor.detach().cpu() for name, tensor in state_dict.items()}
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
         torch.save(
             {
                 "state_dict": state_dict,
                 "class_names": self.class_names,
                 "num_breeds": self.num_breeds,
                 "image_size": self.image_size,
+                "best_valid_loss": self.best_valid_loss,
+                "best_epoch": self.best_epoch,
             },
             filename,
         )
@@ -200,7 +224,7 @@ class DogBreedClassifier:
 
     def load_model_from_file(self, filename: str = DEFAULT_MODEL_PATH) -> None:
         state_dict = self._load_checkpoint(filename)
-        self.get_model()
+        self.get_model(pretrained=False)
         target = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         target.load_state_dict(state_dict)
 
@@ -213,30 +237,51 @@ class DogBreedClassifier:
                 self.num_breeds = int(checkpoint["num_breeds"])
             if checkpoint.get("image_size"):
                 self.image_size = int(checkpoint["image_size"])
+                self._configure_transforms()
+            if checkpoint.get("best_valid_loss") is not None:
+                self.best_valid_loss = float(checkpoint["best_valid_loss"])
+            if checkpoint.get("best_epoch") is not None:
+                self.best_epoch = int(checkpoint["best_epoch"])
             return _unwrap_state_dict(checkpoint["state_dict"])
         return _unwrap_state_dict(checkpoint)
 
-    def _run_eval(self, loader: DataLoader, loss_fn: nn.Module) -> Tuple[float, float]:
+    def _run_eval(self, loader: DataLoader, loss_fn: nn.Module) -> Tuple[float, float, float]:
         model = self._require_model()
         model.eval()
         total_loss = 0.0
         total_correct = 0
+        total_top5 = 0
         total_examples = 0
-        with torch.no_grad():
+        with torch.inference_mode():
             for inputs, targets in loader:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                logits = model(inputs)
-                loss = loss_fn(logits, targets)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=self.amp,
+                ):
+                    logits = model(inputs)
+                    loss = loss_fn(logits, targets)
                 batch_size = targets.size(0)
                 total_loss += loss.item() * batch_size
                 total_correct += (logits.argmax(dim=1) == targets).sum().item()
+                top5_indices = logits.topk(min(5, logits.size(1)), dim=1).indices
+                total_top5 += top5_indices.eq(targets.unsqueeze(1)).any(dim=1).sum().item()
                 total_examples += batch_size
         if total_examples == 0:
-            return 0.0, 0.0
-        return total_loss / total_examples, total_correct / total_examples
+            return 0.0, 0.0, 0.0
+        return (
+            total_loss / total_examples,
+            total_correct / total_examples,
+            total_top5 / total_examples,
+        )
 
     def train(self, model_filename: str = DEFAULT_MODEL_PATH, patience: int = 7) -> None:
+        random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
         train_loader = self.get_train_loader()
         valid_loader = self.get_valid_loader()
         self.get_model()
@@ -247,12 +292,17 @@ class DogBreedClassifier:
         optimizer = SGD(params, lr=self.lr, momentum=0.9, weight_decay=1e-4)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         loss_fn = nn.CrossEntropyLoss()
+        scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
 
         best_valid_loss = float("inf")
         epochs_without_improvement = 0
 
         for epoch in range(self.num_epochs):
             model.train()
+            backbone = model.module if isinstance(model, nn.DataParallel) else model
+            for child in backbone.children():
+                if child is not backbone.fc:
+                    child.eval()
             running_loss = 0.0
             running_correct = 0
             running_examples = 0
@@ -262,10 +312,16 @@ class DogBreedClassifier:
                 targets = targets.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(inputs)
-                loss = loss_fn(logits, targets)
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=self.amp,
+                ):
+                    logits = model(inputs)
+                    loss = loss_fn(logits, targets)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 batch_size = targets.size(0)
                 running_loss += loss.item() * batch_size
@@ -274,7 +330,7 @@ class DogBreedClassifier:
 
             train_loss = running_loss / max(running_examples, 1)
             train_acc = running_correct / max(running_examples, 1)
-            valid_loss, valid_acc = self._run_eval(valid_loader, loss_fn)
+            valid_loss, valid_acc, _ = self._run_eval(valid_loader, loss_fn)
             scheduler.step()
 
             print(
@@ -292,6 +348,8 @@ class DogBreedClassifier:
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
+                self.best_valid_loss = valid_loss
+                self.best_epoch = epoch + 1
                 epochs_without_improvement = 0
                 print("Lowest validation loss; saving model to {}...".format(model_filename))
                 self.save_model(model_filename)
@@ -305,11 +363,13 @@ class DogBreedClassifier:
             self.load_model(model_filename)
 
     def test(self, model_filename: str = DEFAULT_MODEL_PATH) -> float:
-        if self.model is None:
-            self.load_model_from_file(model_filename)
+        # Always honor the requested checkpoint. After training, the in-memory
+        # model contains the final epoch, which is not necessarily the best one.
+        self.load_model_from_file(model_filename)
         test_loader = self.get_test_loader()
-        _, acc = self._run_eval(test_loader, nn.CrossEntropyLoss())
-        print("Test set accuracy: {:.3f}".format(acc))
+        _, acc, top5 = self._run_eval(test_loader, nn.CrossEntropyLoss())
+        self.last_test_top5 = top5
+        print("Test set accuracy: top-1={:.3f} top-5={:.3f}".format(acc, top5))
         return acc
 
     def idx_to_breed_name(self, breed_idx: int) -> str:
@@ -321,7 +381,7 @@ class DogBreedClassifier:
     def predict(self, input_tensor: torch.Tensor) -> List[Prediction]:
         model = self._require_model()
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = model(input_tensor.to(self.device))
             probs = F.softmax(logits, dim=1)
             k = min(3, probs.size(1))
@@ -351,6 +411,8 @@ def _common_cli() -> argparse.ArgumentParser:
     common.add_argument("--num-workers", type=int, default=None)
     common.add_argument("--patience", type=int, default=7, help="Early-stopping patience (0 disables)")
     common.add_argument("--device", default=None, help="cuda, mps, or cpu (default: auto)")
+    common.add_argument("--seed", type=int, default=42)
+    common.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
     return common
 
 
@@ -380,6 +442,8 @@ def _classifier_from_args(args: argparse.Namespace) -> DogBreedClassifier:
         num_epochs=args.epochs,
         num_workers=args.num_workers,
         device=device,
+        seed=args.seed,
+        amp=not args.no_amp,
     )
 
 
